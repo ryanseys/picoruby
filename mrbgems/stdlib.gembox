@@ -3,6 +3,7 @@ MRuby::GemBox.new do |conf|
   conf.gem core: "picoruby-rng"
   conf.gem core: 'picoruby-base16'
   conf.gem core: 'picoruby-base64'
+  conf.gem core: 'picoruby-uri'
   conf.gem core: 'picoruby-json'
   conf.gem core: 'picoruby-yaml'
   if vm_mruby?
