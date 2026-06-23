@@ -130,4 +130,113 @@ class DataTest < Picotest::Test
     assert_equal :foo, obj.kind
   end
 
+  # ---- keyword init ----
+
+  def test_new_keyword
+    _Point = Data.define(:x, :y)
+    p = _Point.new(x: 1, y: 2)
+    assert_equal 1, p.x
+    assert_equal 2, p.y
+  end
+
+  def test_new_keyword_order_independent
+    _Point = Data.define(:x, :y)
+    p = _Point.new(y: 20, x: 10)
+    assert_equal 10, p.x
+    assert_equal 20, p.y
+  end
+
+  # ---- value equality ----
+
+  def test_equality_true
+    _Point = Data.define(:x, :y)
+    assert_true _Point.new(1, 2) == _Point.new(1, 2)
+    assert_true _Point.new(1, 2).eql?(_Point.new(1, 2))
+  end
+
+  def test_equality_false_on_members
+    _Point = Data.define(:x, :y)
+    assert_false _Point.new(1, 2) == _Point.new(1, 3)
+  end
+
+  def test_equality_false_across_classes
+    _A = Data.define(:v)
+    _B = Data.define(:v)
+    assert_false _A.new(1) == _B.new(1)
+  end
+
+  def test_hash_equal_for_equal_values
+    _Point = Data.define(:x, :y)
+    assert_equal _Point.new(1, 2).hash, _Point.new(1, 2).hash
+  end
+
+  # ---- #with ----
+
+  def test_with_replaces_member
+    _Point = Data.define(:x, :y)
+    a = _Point.new(1, 2)
+    b = a.with(y: 9)
+    assert_equal 1, b.x
+    assert_equal 9, b.y
+    assert_equal 2, a.y
+  end
+
+  def test_with_empty_returns_equal_copy
+    _Point = Data.define(:x, :y)
+    a = _Point.new(1, 2)
+    b = a.with
+    assert_equal 1, b.x
+    assert_equal 2, b.y
+    assert_false a.object_id == b.object_id
+  end
+
+  def test_with_unknown_keyword_raises
+    _Point = Data.define(:x, :y)
+    a = _Point.new(1, 2)
+    assert_raise(ArgumentError) { a.with(z: 1) }
+  end
+
+  # ---- pattern matching helpers ----
+
+  def test_deconstruct
+    _Point = Data.define(:x, :y)
+    assert_equal [1, 2], _Point.new(1, 2).deconstruct
+  end
+
+  def test_deconstruct_keys_nil
+    _Point = Data.define(:x, :y)
+    h = _Point.new(1, 2).deconstruct_keys(nil)
+    assert_equal 1, h[:x]
+    assert_equal 2, h[:y]
+  end
+
+  def test_deconstruct_keys_subset
+    _Point = Data.define(:x, :y)
+    h = _Point.new(1, 2).deconstruct_keys([:y])
+    assert_equal 1, h.size
+    assert_equal 2, h[:y]
+  end
+
+  # ---- block form ----
+
+  def test_block_form_defines_methods
+    _Measure = Data.define(:value, :unit) do
+      def label
+        "#{value} #{unit}"
+      end
+    end
+    obj = _Measure.new(10, "kg")
+    # Block form is only supported on the mruby VM; on others the helper is
+    # simply absent, so skip the assertion there.
+    return unless obj.respond_to?(:label)
+    assert_equal "10 kg", obj.label
+  end
+
+  # ---- inspect ----
+
+  def test_inspect_shows_members
+    _Point = Data.define(:x, :y)
+    assert_equal "#<data x=1, y=2>", _Point.new(1, 2).inspect
+  end
+
 end
