@@ -7,6 +7,7 @@
 #include "mruby/string.h"
 #include "mruby/variable.h"
 #include "mruby/array.h"
+#include "mruby/hash.h"
 #include "mruby/proc.h"
 
 #include <stdio.h>
@@ -274,6 +275,40 @@ regexp_create_obj(mrb_state *mrb, int ref_id)
   return mrb_obj_value(rdata);
 }
 
+/* Translate Ruby-only regex escapes into equivalents the JS RegExp engine
+ * accepts. \A / \z / \Z become anchors that hold regardless of flags; \e is
+ * the ESC byte; \h / \H are hex-digit shorthands. Other escapes pass through. */
+static mrb_value
+translate_ruby_regex(mrb_state *mrb, const char *p, int len)
+{
+  mrb_value out = mrb_str_new(mrb, NULL, 0);
+  int i = 0;
+  while (i < len) {
+    if (p[i] == '\\' && i + 1 < len) {
+      const char *rep = NULL;
+      switch (p[i + 1]) {
+        case 'A': rep = "(?<![\\s\\S])"; break;
+        case 'z': rep = "(?![\\s\\S])";  break;
+        case 'Z': rep = "(?![\\s\\S])";  break;
+        case 'e': rep = "\\x1b";         break;
+        case 'h': rep = "[0-9a-fA-F]";   break;
+        case 'H': rep = "[^0-9a-fA-F]";  break;
+        default: break;
+      }
+      if (rep) {
+        mrb_str_cat_cstr(mrb, out, rep);
+      } else {
+        mrb_str_cat(mrb, out, p + i, 2); /* keep the escape as-is */
+      }
+      i += 2;
+      continue;
+    }
+    mrb_str_cat(mrb, out, p + i, 1);
+    i += 1;
+  }
+  return out;
+}
+
 /* Helper: create a MatchData object */
 static mrb_value
 match_data_create_obj(mrb_state *mrb, int ref_id, mrb_value str, mrb_value regexp)
@@ -317,13 +352,9 @@ mrb_regexp_compile(mrb_state *mrb, mrb_value self)
     build_js_flags("", 0, js_flags, sizeof(js_flags));
   }
 
-  /* Create a null-terminated pattern string */
-  char *pat_cstr = (char *)mrb_malloc(mrb, pattern_len + 1);
-  memcpy(pat_cstr, pattern, pattern_len);
-  pat_cstr[pattern_len] = '\0';
-
-  int ref_id = regexp_new(pat_cstr, js_flags);
-  mrb_free(mrb, pat_cstr);
+  /* Translate Ruby-only escapes; the result is NUL-terminated by mruby. */
+  mrb_value translated = translate_ruby_regex(mrb, pattern, pattern_len);
+  int ref_id = regexp_new(RSTRING_PTR(translated), js_flags);
 
   if (ref_id < 0) {
     mrb_raise(mrb, E_ARGUMENT_ERROR, "invalid regular expression");
@@ -822,6 +853,34 @@ mrb_match_data_inspect(mrb_state *mrb, mrb_value self)
 
 /* ---- String extension methods ---- */
 
+/* Helper: build a Regexp that matches a String pattern LITERALLY.
+ * String#sub/#gsub/#split treat a String pattern as plain text (unlike
+ * String#match), so escape every regex metacharacter before compiling. */
+static mrb_value
+regexp_from_literal(mrb_state *mrb, mrb_value str)
+{
+  const char *p = RSTRING_PTR(str);
+  int len = RSTRING_LEN(str);
+  mrb_value escaped = mrb_str_new(mrb, NULL, 0);
+  for (int i = 0; i < len; i++) {
+    char c = p[i];
+    if (c == '\\' || c == '.' || c == '*' || c == '+' || c == '?' ||
+        c == '^' || c == '$' || c == '{' || c == '}' || c == '(' ||
+        c == ')' || c == '|' || c == '[' || c == ']' || c == '/') {
+      char bs = '\\';
+      mrb_str_cat(mrb, escaped, &bs, 1);
+    }
+    mrb_str_cat(mrb, escaped, &c, 1);
+  }
+  char js_flags[16];
+  build_js_flags("", 0, js_flags, sizeof(js_flags));
+  int ref_id = regexp_new(RSTRING_PTR(escaped), js_flags);
+  if (ref_id < 0) {
+    mrb_raise(mrb, E_ARGUMENT_ERROR, "invalid regular expression");
+  }
+  return regexp_create_obj(mrb, ref_id);
+}
+
 /* Helper: get or create Regexp from value */
 static mrb_value
 ensure_regexp(mrb_state *mrb, mrb_value pattern)
@@ -833,7 +892,8 @@ ensure_regexp(mrb_state *mrb, mrb_value pattern)
     /* Create Regexp from string */
     char js_flags[16];
     build_js_flags("", 0, js_flags, sizeof(js_flags));
-    int ref_id = regexp_new(RSTRING_PTR(pattern), js_flags);
+    mrb_value translated = translate_ruby_regex(mrb, RSTRING_PTR(pattern), RSTRING_LEN(pattern));
+    int ref_id = regexp_new(RSTRING_PTR(translated), js_flags);
     if (ref_id < 0) {
       mrb_raise(mrb, E_ARGUMENT_ERROR, "invalid regular expression");
     }
@@ -996,10 +1056,11 @@ do_string_sub_gsub(mrb_state *mrb, mrb_value self, mrb_bool global)
   mrb_value pattern;
   mrb_value replacement = mrb_undef_value();
   mrb_value block = mrb_nil_value();
-  mrb_get_args(mrb, "o|S&", &pattern, &replacement, &block);
+  mrb_get_args(mrb, "o|o&", &pattern, &replacement, &block);
 
   mrb_bool has_replacement = !mrb_undef_p(replacement);
   mrb_bool has_block = !mrb_nil_p(block);
+  mrb_bool hash_replacement = has_replacement && mrb_hash_p(replacement);
 
   if (has_replacement && has_block) {
     mrb_raise(mrb, E_ARGUMENT_ERROR, "both block and replacement argument given");
@@ -1007,8 +1068,14 @@ do_string_sub_gsub(mrb_state *mrb, mrb_value self, mrb_bool global)
   if (!has_replacement && !has_block) {
     mrb_raise(mrb, E_ARGUMENT_ERROR, "wrong number of arguments (given 1, expected 2)");
   }
+  /* A non-Hash replacement must be a String. */
+  if (has_replacement && !hash_replacement) {
+    replacement = mrb_ensure_string_type(mrb, replacement);
+  }
 
-  mrb_value re = ensure_regexp(mrb, pattern);
+  /* A String pattern matches literally (unlike String#match). */
+  mrb_value re = mrb_string_p(pattern) ? regexp_from_literal(mrb, pattern)
+                                       : ensure_regexp(mrb, pattern);
   picorb_regexp *re_data = (picorb_regexp *)DATA_PTR(re);
 
   const char *str_ptr = RSTRING_PTR(self);
@@ -1043,6 +1110,14 @@ do_string_sub_gsub(mrb_state *mrb, mrb_value self, mrb_bool global)
       mrb_value yielded = mrb_yield(mrb, block, full_str);
       mrb_value yield_str = mrb_obj_as_string(mrb, yielded);
       mrb_str_cat_str(mrb, result, yield_str);
+    } else if (hash_replacement) {
+      char *full = regexp_match_item(match_ref, 0);
+      mrb_value full_str = mrb_str_new_cstr(mrb, full ? full : "");
+      if (full) free(full);
+      mrb_value rep = mrb_hash_get(mrb, replacement, full_str);
+      if (!mrb_nil_p(rep)) {
+        mrb_str_cat_str(mrb, result, mrb_obj_as_string(mrb, rep));
+      }
     } else {
       mrb_value expanded = expand_replacement(mrb,
                                               RSTRING_PTR(replacement),
