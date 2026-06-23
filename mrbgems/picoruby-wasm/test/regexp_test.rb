@@ -39,4 +39,53 @@ class RegexpExtTest < Picotest::Test
     assert_true "1aF".match?(/\A\h+\z/)
     assert_false "1ag".match?(/\A\h+\z/)
   end
+
+  # ---- capture globals ----
+
+  def test_match_globals_after_match_op
+    "hi" =~ /(\w)(\w)/
+    assert_not_nil $~
+    assert_equal "h", $1
+    assert_equal "i", $2
+    assert_nil $3
+  end
+
+  def test_match_globals_cleared_on_no_match
+    "hi" =~ /(\w)/
+    "zz" =~ /(\d)/
+    assert_nil $~
+    assert_nil $1
+  end
+
+  def test_gsub_block_sees_dollar_one
+    out = "ab".gsub(/(.)/) { $1.upcase }
+    assert_equal "AB", out
+  end
+
+  def test_last_match
+    "hi" =~ /(\w)(\w)/
+    assert_equal "hi", Regexp.last_match[0]
+    assert_equal "h", Regexp.last_match(1)
+    assert_equal "i", Regexp.last_match(2)
+  end
+
+  # ---- String#scan ----
+
+  def test_scan_no_groups
+    assert_equal ["a", "b", "c"], "a1b2c".scan(/[a-z]/)
+  end
+
+  def test_scan_with_groups
+    assert_equal [["a", "1"], ["b", "2"]], "a1b2".scan(/([a-z])(\d)/)
+  end
+
+  def test_scan_block
+    seen = []
+    "a1b2".scan(/[a-z]/) { |m| seen << m }
+    assert_equal ["a", "b"], seen
+  end
+
+  def test_scan_literal_string
+    assert_equal [".", "."], "a.b.c".scan(".")
+  end
 end
