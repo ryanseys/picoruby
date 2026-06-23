@@ -7,6 +7,7 @@
 #include "mruby/string.h"
 #include "mruby/variable.h"
 #include "mruby/array.h"
+#include "mruby/hash.h"
 #include "mruby/proc.h"
 
 #include <stdio.h>
@@ -822,6 +823,34 @@ mrb_match_data_inspect(mrb_state *mrb, mrb_value self)
 
 /* ---- String extension methods ---- */
 
+/* Helper: build a Regexp that matches a String pattern LITERALLY.
+ * String#sub/#gsub/#split treat a String pattern as plain text (unlike
+ * String#match), so escape every regex metacharacter before compiling. */
+static mrb_value
+regexp_from_literal(mrb_state *mrb, mrb_value str)
+{
+  const char *p = RSTRING_PTR(str);
+  int len = RSTRING_LEN(str);
+  mrb_value escaped = mrb_str_new(mrb, NULL, 0);
+  for (int i = 0; i < len; i++) {
+    char c = p[i];
+    if (c == '\\' || c == '.' || c == '*' || c == '+' || c == '?' ||
+        c == '^' || c == '$' || c == '{' || c == '}' || c == '(' ||
+        c == ')' || c == '|' || c == '[' || c == ']' || c == '/') {
+      char bs = '\\';
+      mrb_str_cat(mrb, escaped, &bs, 1);
+    }
+    mrb_str_cat(mrb, escaped, &c, 1);
+  }
+  char js_flags[16];
+  build_js_flags("", 0, js_flags, sizeof(js_flags));
+  int ref_id = regexp_new(RSTRING_PTR(escaped), js_flags);
+  if (ref_id < 0) {
+    mrb_raise(mrb, E_ARGUMENT_ERROR, "invalid regular expression");
+  }
+  return regexp_create_obj(mrb, ref_id);
+}
+
 /* Helper: get or create Regexp from value */
 static mrb_value
 ensure_regexp(mrb_state *mrb, mrb_value pattern)
@@ -996,10 +1025,11 @@ do_string_sub_gsub(mrb_state *mrb, mrb_value self, mrb_bool global)
   mrb_value pattern;
   mrb_value replacement = mrb_undef_value();
   mrb_value block = mrb_nil_value();
-  mrb_get_args(mrb, "o|S&", &pattern, &replacement, &block);
+  mrb_get_args(mrb, "o|o&", &pattern, &replacement, &block);
 
   mrb_bool has_replacement = !mrb_undef_p(replacement);
   mrb_bool has_block = !mrb_nil_p(block);
+  mrb_bool hash_replacement = has_replacement && mrb_hash_p(replacement);
 
   if (has_replacement && has_block) {
     mrb_raise(mrb, E_ARGUMENT_ERROR, "both block and replacement argument given");
@@ -1007,8 +1037,14 @@ do_string_sub_gsub(mrb_state *mrb, mrb_value self, mrb_bool global)
   if (!has_replacement && !has_block) {
     mrb_raise(mrb, E_ARGUMENT_ERROR, "wrong number of arguments (given 1, expected 2)");
   }
+  /* A non-Hash replacement must be a String. */
+  if (has_replacement && !hash_replacement) {
+    replacement = mrb_ensure_string_type(mrb, replacement);
+  }
 
-  mrb_value re = ensure_regexp(mrb, pattern);
+  /* A String pattern matches literally (unlike String#match). */
+  mrb_value re = mrb_string_p(pattern) ? regexp_from_literal(mrb, pattern)
+                                       : ensure_regexp(mrb, pattern);
   picorb_regexp *re_data = (picorb_regexp *)DATA_PTR(re);
 
   const char *str_ptr = RSTRING_PTR(self);
@@ -1043,6 +1079,14 @@ do_string_sub_gsub(mrb_state *mrb, mrb_value self, mrb_bool global)
       mrb_value yielded = mrb_yield(mrb, block, full_str);
       mrb_value yield_str = mrb_obj_as_string(mrb, yielded);
       mrb_str_cat_str(mrb, result, yield_str);
+    } else if (hash_replacement) {
+      char *full = regexp_match_item(match_ref, 0);
+      mrb_value full_str = mrb_str_new_cstr(mrb, full ? full : "");
+      if (full) free(full);
+      mrb_value rep = mrb_hash_get(mrb, replacement, full_str);
+      if (!mrb_nil_p(rep)) {
+        mrb_str_cat_str(mrb, result, mrb_obj_as_string(mrb, rep));
+      }
     } else {
       mrb_value expanded = expand_replacement(mrb,
                                               RSTRING_PTR(replacement),
