@@ -853,6 +853,47 @@ mrb_match_data_inspect(mrb_state *mrb, mrb_value self)
 
 /* ---- String extension methods ---- */
 
+/* Set $1..$9 from a match's capture groups (nil when absent). */
+static void
+set_capture_globals(mrb_state *mrb, int match_ref)
+{
+  int count = match_ref >= 0 ? regexp_match_length(match_ref) : 0;
+  char nm[3];
+  nm[0] = '$';
+  for (int i = 1; i <= 9; i++) {
+    nm[1] = (char)('0' + i);
+    nm[2] = '\0';
+    mrb_value v = mrb_nil_value();
+    if (i < count && !regexp_match_item_is_undefined(match_ref, i)) {
+      char *s = regexp_match_item(match_ref, i);
+      if (s) { v = mrb_str_new_cstr(mrb, s); free(s); }
+    }
+    mrb_gv_set(mrb, mrb_intern(mrb, nm, 2), v);
+  }
+}
+
+/* Set $~ and $1..$9 from a successful match. */
+static void
+set_match_globals(mrb_state *mrb, mrb_value match_data, int match_ref)
+{
+  mrb_gv_set(mrb, mrb_intern_lit(mrb, "$~"), match_data);
+  set_capture_globals(mrb, match_ref);
+}
+
+/* Clear $~ and $1..$9 after a failed match. */
+static void
+clear_match_globals(mrb_state *mrb)
+{
+  mrb_gv_set(mrb, mrb_intern_lit(mrb, "$~"), mrb_nil_value());
+  char nm[3];
+  nm[0] = '$';
+  for (int i = 1; i <= 9; i++) {
+    nm[1] = (char)('0' + i);
+    nm[2] = '\0';
+    mrb_gv_set(mrb, mrb_intern(mrb, nm, 2), mrb_nil_value());
+  }
+}
+
 /* Helper: build a Regexp that matches a String pattern LITERALLY.
  * String#sub/#gsub/#split treat a String pattern as plain text (unlike
  * String#match), so escape every regex metacharacter before compiling. */
@@ -929,12 +970,15 @@ mrb_string_match(mrb_state *mrb, mrb_value self)
                               byte_off,
                               (int)pos);
   if (match_ref < 0) {
+    clear_match_globals(mrb);
     return mrb_nil_value();
   }
 
   mrb_value frozen_str = mrb_str_new(mrb, RSTRING_PTR(self), RSTRING_LEN(self));
   mrb_obj_freeze(mrb, frozen_str);
-  return match_data_create_obj(mrb, match_ref, frozen_str, re);
+  mrb_value md = match_data_create_obj(mrb, match_ref, frozen_str, re);
+  set_match_globals(mrb, md, match_ref);
+  return md;
 }
 
 /* String#match?(regexp_or_str, pos=0) -> true/false */
@@ -975,8 +1019,14 @@ mrb_string_match_op(mrb_state *mrb, mrb_value self)
 
   int match_ref = regexp_exec(re_data->ref_id, RSTRING_PTR(self), RSTRING_LEN(self), 0, 0);
   if (match_ref < 0) {
+    clear_match_globals(mrb);
     return mrb_nil_value();
   }
+
+  mrb_value frozen_str = mrb_str_new(mrb, RSTRING_PTR(self), RSTRING_LEN(self));
+  mrb_obj_freeze(mrb, frozen_str);
+  mrb_value md = match_data_create_obj(mrb, match_ref, frozen_str, re);
+  set_match_globals(mrb, md, match_ref);
 
   int idx = regexp_match_char_begin(match_ref, 0);
   return mrb_fixnum_value(idx);
@@ -1107,6 +1157,7 @@ do_string_sub_gsub(mrb_state *mrb, mrb_value self, mrb_bool global)
       char *full = regexp_match_item(match_ref, 0);
       mrb_value full_str = mrb_str_new_cstr(mrb, full ? full : "");
       if (full) free(full);
+      set_capture_globals(mrb, match_ref); /* so the block can read $1..$9 */
       mrb_value yielded = mrb_yield(mrb, block, full_str);
       mrb_value yield_str = mrb_obj_as_string(mrb, yielded);
       mrb_str_cat_str(mrb, result, yield_str);
@@ -1152,6 +1203,91 @@ do_string_sub_gsub(mrb_state *mrb, mrb_value self, mrb_bool global)
   return result;
 }
 
+/* String#scan(pattern) -> array; String#scan(pattern) { |m| ... } -> self */
+static mrb_value
+mrb_string_scan(mrb_state *mrb, mrb_value self)
+{
+  mrb_value pattern;
+  mrb_value block = mrb_nil_value();
+  mrb_get_args(mrb, "o&", &pattern, &block);
+
+  mrb_value re = mrb_string_p(pattern) ? regexp_from_literal(mrb, pattern)
+                                       : ensure_regexp(mrb, pattern);
+  picorb_regexp *re_data = (picorb_regexp *)DATA_PTR(re);
+
+  const char *str_ptr = RSTRING_PTR(self);
+  int str_len = RSTRING_LEN(self);
+  mrb_value result = mrb_ary_new(mrb);
+  int byte_pos = 0;
+  int char_pos = 0;
+  mrb_bool matched = FALSE;
+
+  while (byte_pos <= str_len) {
+    int match_ref = regexp_exec(re_data->ref_id,
+                                str_ptr + byte_pos, str_len - byte_pos,
+                                byte_pos, char_pos);
+    if (match_ref < 0) break;
+    matched = TRUE;
+
+    int count = regexp_match_length(match_ref);
+    mrb_value elem;
+    if (count <= 1) {
+      char *full = regexp_match_item(match_ref, 0);
+      elem = mrb_str_new_cstr(mrb, full ? full : "");
+      if (full) free(full);
+    } else {
+      elem = mrb_ary_new_capa(mrb, count - 1);
+      for (int i = 1; i < count; i++) {
+        mrb_value cap = mrb_nil_value();
+        if (!regexp_match_item_is_undefined(match_ref, i)) {
+          char *s = regexp_match_item(match_ref, i);
+          if (s) { cap = mrb_str_new_cstr(mrb, s); free(s); }
+        }
+        mrb_ary_push(mrb, elem, cap);
+      }
+    }
+    set_capture_globals(mrb, match_ref);
+
+    int byte_begin = regexp_match_byte_begin(match_ref, 0);
+    int byte_end   = regexp_match_byte_end(match_ref, 0);
+    int char_end   = regexp_match_char_end(match_ref, 0);
+    regexp_release_ref(match_ref);
+
+    if (!mrb_nil_p(block)) {
+      mrb_yield(mrb, block, elem);
+    } else {
+      mrb_ary_push(mrb, result, elem);
+    }
+
+    if (byte_end == byte_begin) {
+      int step = utf8_step(str_ptr, str_len, byte_pos);
+      if (step == 0) break;
+      byte_pos += step;
+      char_pos += 1;
+    } else {
+      byte_pos = byte_end;
+      char_pos = char_end;
+    }
+  }
+
+  if (!matched) clear_match_globals(mrb);
+  if (!mrb_nil_p(block)) return self;
+  return result;
+}
+
+/* Regexp.last_match -> MatchData or nil; Regexp.last_match(n) -> nth group */
+static mrb_value
+mrb_regexp_last_match(mrb_state *mrb, mrb_value klass)
+{
+  mrb_value n = mrb_undef_value();
+  mrb_get_args(mrb, "|o", &n);
+  mrb_value md = mrb_gv_get(mrb, mrb_intern_lit(mrb, "$~"));
+  if (mrb_nil_p(md) || mrb_undef_p(n)) {
+    return md;
+  }
+  return mrb_funcall(mrb, md, "[]", 1, n);
+}
+
 /* String#gsub(pattern, replacement) / String#gsub(pattern) { |m| ... } */
 static mrb_value
 mrb_string_gsub(mrb_state *mrb, mrb_value self)
@@ -1177,6 +1313,7 @@ mrb_regexp_init(mrb_state *mrb)
 
   mrb_define_class_method_id(mrb, class_Regexp, MRB_SYM(compile), mrb_regexp_compile, MRB_ARGS_ARG(1, 2));
   mrb_define_class_method_id(mrb, class_Regexp, MRB_SYM(new), mrb_regexp_compile, MRB_ARGS_ARG(1, 2));
+  mrb_define_class_method_id(mrb, class_Regexp, MRB_SYM(last_match), mrb_regexp_last_match, MRB_ARGS_OPT(1));
 
   mrb_define_method_id(mrb, class_Regexp, MRB_SYM(match), mrb_regexp_match, MRB_ARGS_ARG(1, 1));
   mrb_define_method_id(mrb, class_Regexp, MRB_SYM_Q(match), mrb_regexp_match_p, MRB_ARGS_ARG(1, 1));
@@ -1217,4 +1354,5 @@ mrb_regexp_init(mrb_state *mrb)
   mrb_define_method_id(mrb, string_class, mrb_intern_lit(mrb, "=~"), mrb_string_match_op, MRB_ARGS_REQ(1));
   mrb_define_method_id(mrb, string_class, MRB_SYM(gsub), mrb_string_gsub, MRB_ARGS_ARG(1, 1) | MRB_ARGS_BLOCK());
   mrb_define_method_id(mrb, string_class, MRB_SYM(sub), mrb_string_sub, MRB_ARGS_ARG(1, 1) | MRB_ARGS_BLOCK());
+  mrb_define_method_id(mrb, string_class, MRB_SYM(scan), mrb_string_scan, MRB_ARGS_REQ(1) | MRB_ARGS_BLOCK());
 }
