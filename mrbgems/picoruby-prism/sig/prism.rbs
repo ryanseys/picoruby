@@ -14,7 +14,13 @@ class Prism
     @errors: [Prism::ParseError]
   end
 
-  def parse: (String script) -> String # TODO: Prism::ParseResult
+  # Pretty-printed AST dump (empty when prism is built with
+  # PRISM_EXCLUDE_PRETTYPRINT, e.g. when reusing mruby-compiler's prism).
+  def self.parse: (String source) -> String
+  # [[token_type, start_offset, end_offset], ...]
+  def self.lex: (String source) -> Array[[Symbol, Integer, Integer]]
+  # [{ message: String, line: Integer, column: Integer }, ...]
+  def self.errors: (String source) -> Array[Hash[Symbol, untyped]]
 end
 
 class String

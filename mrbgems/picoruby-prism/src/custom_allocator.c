@@ -1,3 +1,5 @@
+#if defined(PICORB_VM_MRUBYC)
+
 #include "alloc.h"
 #include <string.h>
 
@@ -34,3 +36,5 @@ picorb_realloc(void *ptr, unsigned int size)
   }
 }
 
+
+#endif /* PICORB_VM_MRUBYC */
